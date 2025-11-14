@@ -18,6 +18,17 @@ const {
 const router = express.Router();
 
 const EMAIL_VERIFICATION_TTL_HOURS = 48;
+const OAUTH_STATE_TTL_SECONDS = 10 * 60;
+const GOOGLE_OAUTH_SCOPE = 'openid email profile';
+const APPLE_OAUTH_SCOPE = 'name email';
+const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+const APPLE_JWKS_URL = 'https://appleid.apple.com/auth/keys';
+const JWKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 oră
+
+const jwksCache = {
+  google: { url: GOOGLE_JWKS_URL, fetchedAt: 0, pems: new Map() },
+  apple: { url: APPLE_JWKS_URL, fetchedAt: 0, pems: new Map() },
+};
 
 function getPublicAppBaseUrl() {
   return (
@@ -82,7 +93,158 @@ function sha256(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
 
+function base64UrlEncode(buffer) {
+  return Buffer.from(buffer)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function createCodeVerifier() {
+  return base64UrlEncode(crypto.randomBytes(32));
+}
+
+function createCodeChallenge(verifier) {
+  return base64UrlEncode(crypto.createHash('sha256').update(verifier).digest());
+}
+
+function createNonce() {
+  return base64UrlEncode(crypto.randomBytes(16));
+}
+
+function sanitizeRedirectPath(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith('/')) {
+    if (trimmed.startsWith('//')) {
+      return null;
+    }
+    return trimmed;
+  }
+  try {
+    const url = new URL(trimmed);
+    if (url.origin === 'null') {
+      return null;
+    }
+    // Accept numai URL-uri care indică aceeași origine ca aplicația publică
+    const base = getPublicAppBaseUrl();
+    const allowed = new URL(base);
+    if (url.origin === allowed.origin) {
+      return url.pathname + (url.search || '');
+    }
+  } catch (err) {
+    return null;
+  }
+  return null;
+}
+
+function getGoogleConfig() {
+  const clientId = process.env.PUBLIC_AUTH_GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.PUBLIC_AUTH_GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return null;
+  }
+  return { clientId, clientSecret };
+}
+
+function getAppleConfig() {
+  const clientId = process.env.PUBLIC_AUTH_APPLE_CLIENT_ID;
+  if (!clientId) {
+    return null;
+  }
+  return { clientId };
+}
+
+function buildBackendAbsoluteUrl(req, pathname, params = {}) {
+  const protoHeader = req.headers['x-forwarded-proto'];
+  const proto = Array.isArray(protoHeader)
+    ? protoHeader[0]
+    : typeof protoHeader === 'string'
+      ? protoHeader.split(',')[0]
+      : req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  const base = `${proto || 'https'}://${host}`;
+  const url = new URL(pathname, base);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value != null) {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+}
+
+function buildAppRedirectUrl(pathname, params = {}) {
+  const base = getPublicAppBaseUrl();
+  const safePath = pathname && typeof pathname === 'string' ? pathname : '/account';
+  let url;
+  try {
+    url = new URL(safePath, base);
+  } catch (_) {
+    url = new URL('/account', base);
+  }
+  Object.entries(params).forEach(([key, value]) => {
+    if (value != null) {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+}
+
+function createOAuthState(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: OAUTH_STATE_TTL_SECONDS });
+}
+
+function verifyOAuthState(token) {
+  return jwt.verify(token, process.env.JWT_SECRET);
+}
+
+async function refreshJwks(provider) {
+  const cache = jwksCache[provider];
+  if (!cache) {
+    throw new Error(`Provider necunoscut pentru JWKS: ${provider}`);
+  }
+  const response = await fetch(cache.url);
+  if (!response.ok) {
+    throw new Error(`Nu am putut descărca cheile publice pentru ${provider}.`);
+  }
+  const data = await response.json();
+  cache.pems.clear();
+  const keys = Array.isArray(data.keys) ? data.keys : [];
+  for (const jwk of keys) {
+    if (!jwk || !jwk.kid) continue;
+    try {
+      const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+      const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
+      cache.pems.set(jwk.kid, pem);
+    } catch (err) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn(`[oauth] conversia JWK a eșuat pentru ${provider}:`, err?.message || err);
+      }
+    }
+  }
+  cache.fetchedAt = Date.now();
+}
+
+async function getPemForProvider(provider, kid) {
+  const cache = jwksCache[provider];
+  if (!cache) {
+    throw new Error(`Provider necunoscut: ${provider}`);
+  }
+  const now = Date.now();
+  if (!cache.pems.size || now - cache.fetchedAt > JWKS_CACHE_TTL_MS || !cache.pems.has(kid)) {
+    await refreshJwks(provider);
+  }
+  return cache.pems.get(kid) || null;
+}
+
 let emailVerificationTableReady = false;
+let oauthIdentityTableReady = false;
 
 function mapUser(row) {
   const id = typeof row.id === 'bigint' ? Number(row.id) : Number(row.id);
@@ -126,6 +288,247 @@ async function ensureEmailVerificationTable() {
   );
 
   emailVerificationTableReady = true;
+}
+
+async function ensureOAuthIdentitiesTable() {
+  if (oauthIdentityTableReady) {
+    return;
+  }
+
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS public_user_oauth_identities (
+      id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id bigint(20) UNSIGNED NOT NULL,
+      provider varchar(32) NOT NULL,
+      provider_user_id varchar(191) NOT NULL,
+      email varchar(255) DEFAULT NULL,
+      name varchar(255) DEFAULT NULL,
+      raw_profile json DEFAULT NULL,
+      created_at datetime NOT NULL DEFAULT current_timestamp(),
+      updated_at datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_public_user_oauth_identity (provider, provider_user_id),
+      KEY idx_public_user_oauth_email (email),
+      CONSTRAINT fk_public_user_oauth_user FOREIGN KEY (user_id)
+        REFERENCES public_users (id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+
+  oauthIdentityTableReady = true;
+}
+
+async function loadOAuthIdentity(provider, providerUserId) {
+  await ensureOAuthIdentitiesTable();
+  const { rows } = await db.query(
+    `SELECT id, user_id, email, name
+       FROM public_user_oauth_identities
+      WHERE provider = ? AND provider_user_id = ?
+      LIMIT 1`,
+    [provider, providerUserId]
+  );
+  return rows && rows.length ? rows[0] : null;
+}
+
+async function linkOAuthIdentity(userId, provider, identityData) {
+  await ensureOAuthIdentitiesTable();
+  const cleanedEmail = identityData.email ? String(identityData.email).trim().slice(0, 255) : null;
+  const cleanedName = identityData.name ? String(identityData.name).trim().slice(0, 255) : null;
+  let rawProfile = null;
+  if (identityData.rawProfile) {
+    try {
+      rawProfile = JSON.stringify(identityData.rawProfile);
+      if (rawProfile.length > 65000) {
+        rawProfile = rawProfile.slice(0, 65000);
+      }
+    } catch (_) {
+      rawProfile = null;
+    }
+  }
+
+  await db.query(
+    `INSERT INTO public_user_oauth_identities
+      (user_id, provider, provider_user_id, email, name, raw_profile, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
+     ON DUPLICATE KEY UPDATE
+       email = VALUES(email),
+       name = VALUES(name),
+       raw_profile = VALUES(raw_profile),
+       updated_at = NOW()`,
+    [userId, provider, identityData.providerUserId, cleanedEmail, cleanedName, rawProfile]
+  );
+}
+
+async function findOrCreateUserForOAuth(provider, identityData) {
+  await ensureOAuthIdentitiesTable();
+
+  const existingIdentity = await loadOAuthIdentity(provider, identityData.providerUserId);
+  let email = identityData.email || null;
+  if (!email && existingIdentity && existingIdentity.email) {
+    email = existingIdentity.email;
+  }
+
+  let userRow = null;
+  if (existingIdentity) {
+    const userId = typeof existingIdentity.user_id === 'bigint' ? Number(existingIdentity.user_id) : existingIdentity.user_id;
+    if (Number.isFinite(userId)) {
+      userRow = await loadUserById(userId);
+    }
+  }
+
+  let normalizedEmail = email ? normalizeEmail(email) : null;
+
+  if (!userRow && normalizedEmail) {
+    const { rows } = await db.query(
+      `SELECT id, email_verified_at, name
+         FROM public_users
+        WHERE email_normalized = ?
+        LIMIT 1`,
+      [normalizedEmail]
+    );
+    if (rows && rows.length) {
+      const found = rows[0];
+      const userId = typeof found.id === 'bigint' ? Number(found.id) : found.id;
+      if (Number.isFinite(userId)) {
+        userRow = await loadUserById(userId);
+      }
+    }
+  }
+
+  if (!userRow) {
+    if (!email || !normalizedEmail) {
+      throw new Error('Nu am primit o adresă de email validă de la furnizorul de autentificare.');
+    }
+
+    const insert = await db.query(
+      `INSERT INTO public_users
+        (email, email_normalized, password_hash, name, phone, phone_normalized, email_verified_at, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, NULL, NULL, ?, NOW(), NOW())`,
+      [
+        String(email).trim().slice(0, 255),
+        normalizedEmail,
+        identityData.name ? String(identityData.name).trim().slice(0, 255) : null,
+        identityData.emailVerified ? new Date() : null,
+      ]
+    );
+
+    const newUserId = insert.insertId;
+    userRow = await loadUserById(newUserId);
+  } else {
+    const updates = [];
+    const params = [];
+
+    if (identityData.emailVerified) {
+      const { rows } = await db.query('SELECT email_verified_at FROM public_users WHERE id = ? LIMIT 1', [userRow.id]);
+      const verifiedAt = rows && rows.length ? rows[0].email_verified_at : null;
+      if (!verifiedAt) {
+        updates.push('email_verified_at = NOW()');
+      }
+    }
+
+    if (identityData.name) {
+      const trimmed = String(identityData.name).trim().slice(0, 255);
+      if (trimmed && !userRow.name) {
+        updates.push('name = ?');
+        params.push(trimmed);
+      }
+    }
+
+    if (updates.length) {
+      updates.push('updated_at = NOW()');
+      params.push(userRow.id);
+      await db.query(`UPDATE public_users SET ${updates.join(', ')} WHERE id = ?`, params);
+      userRow = await loadUserById(userRow.id);
+    }
+  }
+
+  if (!userRow) {
+    throw new Error('Nu am putut crea sau încărca utilizatorul pentru autentificarea socială.');
+  }
+
+  await linkOAuthIdentity(userRow.id, provider, { ...identityData, email });
+
+  return userRow;
+}
+
+async function verifyGoogleIdToken(idToken, expectedNonce, clientId) {
+  const decoded = jwt.decode(idToken, { complete: true });
+  if (!decoded || !decoded.header || !decoded.payload) {
+    throw new Error('Tokenul Google nu a putut fi decodat.');
+  }
+  const pem = await getPemForProvider('google', decoded.header.kid);
+  if (!pem) {
+    throw new Error('Nu am putut valida semnătura tokenului Google.');
+  }
+  const payload = jwt.verify(idToken, pem, {
+    algorithms: ['RS256'],
+    audience: clientId,
+    issuer: ['https://accounts.google.com', 'accounts.google.com'],
+  });
+  if (expectedNonce && payload.nonce && payload.nonce !== expectedNonce) {
+    throw new Error('Nonce invalid pentru tokenul Google.');
+  }
+  return payload;
+}
+
+async function verifyAppleIdToken(idToken, expectedNonce, clientId) {
+  const decoded = jwt.decode(idToken, { complete: true });
+  if (!decoded || !decoded.header || !decoded.payload) {
+    throw new Error('Tokenul Apple nu a putut fi decodat.');
+  }
+  const pem = await getPemForProvider('apple', decoded.header.kid);
+  if (!pem) {
+    throw new Error('Nu am putut valida semnătura tokenului Apple.');
+  }
+  const payload = jwt.verify(idToken, pem, {
+    algorithms: ['RS256'],
+    audience: clientId,
+    issuer: 'https://appleid.apple.com',
+  });
+  if (expectedNonce && payload.nonce && payload.nonce !== expectedNonce) {
+    throw new Error('Nonce invalid pentru tokenul Apple.');
+  }
+  return payload;
+}
+
+async function exchangeGoogleCodeForTokens(code, codeVerifier, callbackUrl, config) {
+  const body = new URLSearchParams({
+    code,
+    client_id: config.clientId,
+    client_secret: config.clientSecret,
+    redirect_uri: callbackUrl,
+    grant_type: 'authorization_code',
+  });
+  if (codeVerifier) {
+    body.set('code_verifier', codeVerifier);
+  }
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  const payload = await response.json();
+  if (!response.ok || payload.error) {
+    const message = payload.error_description || payload.error || 'Schimbul codului Google a eșuat.';
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function parseAppleUserInfo(raw) {
+  if (!raw) {
+    return { name: null };
+  }
+  try {
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const firstName = data?.name?.firstName ? String(data.name.firstName).trim() : '';
+    const lastName = data?.name?.lastName ? String(data.name.lastName).trim() : '';
+    const name = `${firstName} ${lastName}`.trim() || null;
+    return { name };
+  } catch (_) {
+    return { name: null };
+  }
 }
 
 async function createEmailVerificationToken(userId) {
@@ -277,11 +680,18 @@ async function createSession(req, res, userRow, options = {}) {
   setPublicAuthCookies(res, accessToken, refreshToken, { remember, refreshTtlSec: ttlSec });
   const session = buildSession(userRow);
 
+  if (options.redirectTo) {
+    res.redirect(options.redirectTo);
+    return session;
+  }
+
   res.status(options.statusCode || 200).json({
     success: true,
     message: options.message || null,
     session,
   });
+
+  return session;
 }
 
 router.get('/session', async (req, res) => {
@@ -660,56 +1070,298 @@ router.post('/logout', requirePublicAuth, async (req, res) => {
   return res.json({ success: true, message: 'Ai fost deconectat.' });
 });
 
-const SUPPORTED_OAUTH = {
-  google: { envKey: 'PUBLIC_AUTH_GOOGLE_URL' },
-  apple: { envKey: 'PUBLIC_AUTH_APPLE_URL' },
-};
+function normalizeRememberParam(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const lower = value.toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(lower)) {
+    return 1;
+  }
+  if (['0', 'false', 'no', 'off'].includes(lower)) {
+    return 0;
+  }
+  return null;
+}
+
+function normalizeVariant(value) {
+  return value === 'register' ? 'register' : 'login';
+}
+
+function providerNotConfiguredReason(provider) {
+  if (provider === 'google') {
+    return 'Configurează PUBLIC_AUTH_GOOGLE_CLIENT_ID și PUBLIC_AUTH_GOOGLE_CLIENT_SECRET.';
+  }
+  if (provider === 'apple') {
+    return 'Configurează PUBLIC_AUTH_APPLE_CLIENT_ID în backend.';
+  }
+  return 'Provider neconfigurat.';
+}
 
 router.get('/oauth/providers', (req, res) => {
-  const redirect = typeof req.query.redirect === 'string' ? req.query.redirect : null;
-  const providers = Object.entries(SUPPORTED_OAUTH).map(([id, meta]) => {
-    const base = process.env[meta.envKey];
-    if (!base) {
-      return { id, enabled: false, url: null, reason: 'neconfigurat' };
-    }
-    let url = base;
-    if (redirect) {
-      try {
-        const parsed = new URL(base);
-        parsed.searchParams.set('redirect', redirect);
-        url = parsed.toString();
-      } catch (_) {
-        // dacă URL-ul din env nu e valid, îl trimitem ca atare fără redirect suplimentar
-        url = base;
-      }
-    }
-    return { id, enabled: true, url };
-  });
+  const redirectRaw = typeof req.query.redirect === 'string' ? req.query.redirect : null;
+  const redirectPath = sanitizeRedirectPath(redirectRaw) || '/account';
+  const variant = normalizeVariant(typeof req.query.variant === 'string' ? req.query.variant : null);
+  const rememberFlag = normalizeRememberParam(req.query.remember);
+
+  const providers = [];
+
+  const googleConfig = getGoogleConfig();
+  if (googleConfig) {
+    providers.push({
+      id: 'google',
+      enabled: true,
+      url: buildBackendAbsoluteUrl(req, '/api/public/auth/oauth/google', {
+        redirect: redirectPath,
+        variant,
+        ...(rememberFlag != null ? { remember: rememberFlag } : {}),
+      }),
+    });
+  } else {
+    providers.push({ id: 'google', enabled: false, url: null, reason: providerNotConfiguredReason('google') });
+  }
+
+  const appleConfig = getAppleConfig();
+  if (appleConfig) {
+    providers.push({
+      id: 'apple',
+      enabled: true,
+      url: buildBackendAbsoluteUrl(req, '/api/public/auth/oauth/apple', {
+        redirect: redirectPath,
+        variant,
+        ...(rememberFlag != null ? { remember: rememberFlag } : {}),
+      }),
+    });
+  } else {
+    providers.push({ id: 'apple', enabled: false, url: null, reason: providerNotConfiguredReason('apple') });
+  }
 
   return res.json({ providers });
 });
 
-router.get('/oauth/:provider', (req, res) => {
+async function startOAuth(req, res) {
   const provider = req.params.provider;
-  if (!SUPPORTED_OAUTH[provider]) {
-    return res.status(404).json({ error: 'provider necunoscut' });
-  }
-  const base = process.env[SUPPORTED_OAUTH[provider].envKey];
-  if (!base) {
-    return res.status(501).json({ error: 'provider neconfigurat' });
-  }
-  const redirect = typeof req.query.redirect === 'string' ? req.query.redirect : null;
-  let url = base;
-  if (redirect) {
-    try {
-      const parsed = new URL(base);
-      parsed.searchParams.set('redirect', redirect);
-      url = parsed.toString();
-    } catch (_) {
-      url = base;
+  const variant = normalizeVariant(typeof req.query.variant === 'string' ? req.query.variant : null);
+  const redirectPath = sanitizeRedirectPath(typeof req.query.redirect === 'string' ? req.query.redirect : null) || '/account';
+  const rememberFlag = normalizeRememberParam(req.query.remember);
+
+  const baseState = {
+    provider,
+    redirect: redirectPath,
+    variant,
+    remember: rememberFlag === 1 ? 1 : 0,
+  };
+
+  try {
+    if (provider === 'google') {
+      const config = getGoogleConfig();
+      if (!config) {
+        return res.status(501).send('Autentificarea Google nu este configurată.');
+      }
+      const codeVerifier = createCodeVerifier();
+      const nonce = createNonce();
+      const state = createOAuthState({ ...baseState, codeVerifier, nonce });
+      const callbackUrl = buildBackendAbsoluteUrl(req, '/api/public/auth/oauth/google/callback');
+      const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', config.clientId);
+      authUrl.searchParams.set('redirect_uri', callbackUrl);
+      authUrl.searchParams.set('scope', GOOGLE_OAUTH_SCOPE);
+      authUrl.searchParams.set('state', state);
+      authUrl.searchParams.set('code_challenge_method', 'S256');
+      authUrl.searchParams.set('code_challenge', createCodeChallenge(codeVerifier));
+      authUrl.searchParams.set('access_type', 'offline');
+      authUrl.searchParams.set('prompt', 'select_account');
+      authUrl.searchParams.set('nonce', nonce);
+      return res.redirect(authUrl.toString());
     }
+
+    if (provider === 'apple') {
+      const config = getAppleConfig();
+      if (!config) {
+        return res.status(501).send('Autentificarea Apple nu este configurată.');
+      }
+      const codeVerifier = createCodeVerifier();
+      const nonce = createNonce();
+      const state = createOAuthState({ ...baseState, codeVerifier, nonce });
+      const callbackUrl = buildBackendAbsoluteUrl(req, '/api/public/auth/oauth/apple/callback');
+      const authUrl = new URL('https://appleid.apple.com/auth/authorize');
+      authUrl.searchParams.set('response_type', 'code id_token');
+      authUrl.searchParams.set('response_mode', 'form_post');
+      authUrl.searchParams.set('client_id', config.clientId);
+      authUrl.searchParams.set('redirect_uri', callbackUrl);
+      authUrl.searchParams.set('scope', APPLE_OAUTH_SCOPE);
+      authUrl.searchParams.set('state', state);
+      authUrl.searchParams.set('nonce', nonce);
+      authUrl.searchParams.set('code_challenge_method', 'S256');
+      authUrl.searchParams.set('code_challenge', createCodeChallenge(codeVerifier));
+      return res.redirect(authUrl.toString());
+    }
+
+    return res.status(404).json({ error: 'provider necunoscut' });
+  } catch (err) {
+    console.error(`[publicAuth] start oauth ${provider} failed:`, err);
+    const fallbackPath = normalizeVariant(baseState.variant) === 'register' ? '/register' : '/login';
+    const params = {
+      oauth: provider,
+      status: 'error',
+      reason: 'start_failed',
+    };
+    if (baseState.redirect) {
+      params.redirect = baseState.redirect;
+    }
+    const fallback = buildAppRedirectUrl(fallbackPath, params);
+    return res.redirect(fallback);
   }
-  return res.redirect(url);
-});
+}
+
+function buildOAuthErrorRedirect(statePayload, provider, reason) {
+  const variant = normalizeVariant(statePayload?.variant);
+  const redirectTarget = variant === 'register' ? '/register' : '/login';
+  const params = {
+    oauth: provider,
+    status: 'error',
+    reason,
+  };
+  if (statePayload?.redirect) {
+    params.redirect = statePayload.redirect;
+  }
+  return buildAppRedirectUrl(redirectTarget, params);
+}
+
+router.get('/oauth/:provider', startOAuth);
+router.get('/oauth/:provider/start', startOAuth);
+
+async function handleOAuthCallback(req, res) {
+  const provider = req.params.provider;
+  const params = req.method === 'POST' ? req.body || {} : req.query || {};
+  const stateToken = typeof params.state === 'string' ? params.state : null;
+  const fallback = buildAppRedirectUrl('/login', {
+    oauth: provider,
+    status: 'error',
+    reason: 'missing_state',
+  });
+
+  if (!stateToken) {
+    return res.redirect(fallback);
+  }
+
+  let statePayload;
+  try {
+    statePayload = verifyOAuthState(stateToken);
+  } catch (err) {
+    console.error(`[publicAuth] ${provider} oauth state invalid:`, err);
+    return res.redirect(fallback);
+  }
+
+  if (!statePayload || statePayload.provider !== provider) {
+    return res.redirect(fallback);
+  }
+
+  const remember = statePayload.remember === 1 || statePayload.remember === '1';
+  const successRedirect = buildAppRedirectUrl(statePayload.redirect || '/account', {
+    oauth: provider,
+    status: 'success',
+  });
+
+  try {
+    if (provider === 'google') {
+      const config = getGoogleConfig();
+      if (!config) {
+        return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'not_configured'));
+      }
+      const code = typeof params.code === 'string' ? params.code : null;
+      if (!code) {
+        return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'missing_code'));
+      }
+      const callbackUrl = buildBackendAbsoluteUrl(req, '/api/public/auth/oauth/google/callback');
+      const tokens = await exchangeGoogleCodeForTokens(code, statePayload.codeVerifier, callbackUrl, config);
+      const idToken = tokens.id_token;
+      if (!idToken) {
+        return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'missing_token'));
+      }
+      const googlePayload = await verifyGoogleIdToken(idToken, statePayload.nonce, config.clientId);
+      const fullName = googlePayload.name
+        ? String(googlePayload.name)
+        : `${googlePayload.given_name || ''} ${googlePayload.family_name || ''}`.trim() || null;
+      const identity = {
+        providerUserId: googlePayload.sub,
+        email: googlePayload.email || null,
+        emailVerified: googlePayload.email_verified === true || googlePayload.email_verified === 'true',
+        name: fullName,
+        rawProfile: {
+          idToken: {
+            sub: googlePayload.sub,
+            email: googlePayload.email || null,
+            email_verified: googlePayload.email_verified ?? null,
+            name: fullName,
+            given_name: googlePayload.given_name || null,
+            family_name: googlePayload.family_name || null,
+            locale: googlePayload.locale || null,
+            picture: googlePayload.picture || null,
+          },
+          token: {
+            scope: tokens.scope || null,
+            expires_in: tokens.expires_in || null,
+          },
+        },
+      };
+
+      const userRow = await findOrCreateUserForOAuth(provider, identity);
+      await createSession(req, res, userRow, {
+        remember,
+        redirectTo: successRedirect,
+        message: 'Autentificare reușită.',
+      });
+      return;
+    }
+
+    if (provider === 'apple') {
+      const config = getAppleConfig();
+      if (!config) {
+        return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'not_configured'));
+      }
+      const idToken = typeof params.id_token === 'string' ? params.id_token : null;
+      if (!idToken) {
+        return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'missing_token'));
+      }
+      const applePayload = await verifyAppleIdToken(idToken, statePayload.nonce, config.clientId);
+      const userInfo = parseAppleUserInfo(params.user);
+      const identity = {
+        providerUserId: applePayload.sub,
+        email: applePayload.email || null,
+        emailVerified: applePayload.email_verified === true || applePayload.email_verified === 'true',
+        name: userInfo.name || null,
+        rawProfile: {
+          idToken: {
+            sub: applePayload.sub,
+            email: applePayload.email || null,
+            email_verified: applePayload.email_verified ?? null,
+          },
+        },
+      };
+
+      const userRow = await findOrCreateUserForOAuth(provider, identity);
+      await createSession(req, res, userRow, {
+        remember,
+        redirectTo: successRedirect,
+        message: 'Autentificare reușită.',
+      });
+      return;
+    }
+
+    return res.redirect(buildOAuthErrorRedirect(statePayload, provider, 'unknown_provider'));
+  } catch (err) {
+    console.error(`[publicAuth] ${provider} oauth callback failed:`, err);
+    const reason =
+      typeof err?.message === 'string' && err.message.toLowerCase().includes('email')
+        ? 'missing_email'
+        : 'oauth_failed';
+    return res.redirect(buildOAuthErrorRedirect(statePayload, provider, reason));
+  }
+}
+
+router.get('/oauth/:provider/callback', handleOAuthCallback);
+router.post('/oauth/:provider/callback', handleOAuthCallback);
 
 module.exports = router;

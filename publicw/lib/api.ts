@@ -440,10 +440,20 @@ export interface OAuthProviderAvailability {
   reason?: string | null;
 }
 
-export async function fetchOAuthProviders(redirectTo?: string | null): Promise<OAuthProviderAvailability[]> {
-  const params = redirectTo ? `?redirect=${encodeURIComponent(redirectTo)}` : '';
+export async function fetchOAuthProviders(
+  redirectTo?: string | null,
+  variant?: 'login' | 'register',
+): Promise<OAuthProviderAvailability[]> {
+  const search = new URLSearchParams();
+  if (redirectTo) {
+    search.set('redirect', redirectTo);
+  }
+  if (variant) {
+    search.set('variant', variant);
+  }
+  const query = search.toString();
   const response = await request<{ providers?: OAuthProviderAvailability[] }>(
-    `/api/public/auth/oauth/providers${params}`,
+    `/api/public/auth/oauth/providers${query ? `?${query}` : ''}`,
   );
   return Array.isArray(response?.providers) ? response.providers : [];
 }
