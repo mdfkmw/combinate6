@@ -777,7 +777,7 @@ export default function SeatModal({ isOpen, onClose, onConfirm, trip, travelDate
             <Legend color="bg-brand text-white" label="Selectat" />
             <Legend color="bg-amber-500/80 text-black" label="În curs de rezervare" />
             <Legend color="bg-white/20" label="Ocupat" />
-            <Legend color="bg-rose-500/80 text-black" label="Blocat online" />
+            <Legend color="bg-rose-500/80 text-black" label="Ocupat" />
           </div>
 
           <div className="max-h-[70vh] overflow-y-auto px-6 py-6 space-y-6">
