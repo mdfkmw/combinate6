@@ -76,7 +76,7 @@ export default function SocialLoginButtons({ redirectTo, variant = 'login' }: So
 
     const loadProviders = async () => {
       try {
-        const providersInfo = await fetchOAuthProviders(redirectTo ?? undefined)
+        const providersInfo = await fetchOAuthProviders(redirectTo ?? undefined, variant)
         if (!mounted) return
         const next = createEmptyState()
         for (const provider of providersInfo) {
@@ -99,7 +99,7 @@ export default function SocialLoginButtons({ redirectTo, variant = 'login' }: So
     return () => {
       mounted = false
     }
-  }, [redirectTo])
+  }, [redirectTo, variant])
 
   const handleClick = useCallback(
     (provider: OAuthProvider, label: string) => {

@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useState, type FormEvent } from 'react'
+import { Suspense, useEffect, useState, type FormEvent } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -12,6 +12,9 @@ function RegisterPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const redirectTo = searchParams?.get('redirect') || '/account'
+  const oauthProvider = searchParams?.get('oauth')
+  const oauthStatus = searchParams?.get('status')
+  const oauthReason = searchParams?.get('reason')
   const { refresh: refreshSession, setSession } = usePublicSession()
 
   const [name, setName] = useState('')
@@ -22,6 +25,36 @@ function RegisterPageContent() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!oauthProvider || !oauthStatus) {
+      return
+    }
+    const providerLabel = oauthProvider === 'apple' ? 'Apple' : 'Google'
+    if (oauthStatus === 'error') {
+      const message = (() => {
+        switch (oauthReason) {
+          case 'missing_email':
+            return `Nu am primit adresa de email de la ${providerLabel}. Apple transmite emailul doar la prima conectare; verifică permisiunile și încearcă din nou.`
+          case 'not_configured':
+          case 'start_failed':
+            return 'Crearea contului prin autentificare socială nu este disponibilă momentan. Încearcă din nou mai târziu.'
+          case 'missing_code':
+          case 'missing_token':
+          case 'missing_state':
+          case 'oauth_failed':
+          case 'unknown_provider':
+          default:
+            return `Nu am putut crea contul folosind ${providerLabel}. Te rugăm să încerci din nou.`
+        }
+      })()
+      setError(message)
+      setInfo(null)
+    } else if (oauthStatus === 'success') {
+      setInfo(`Cont creat și autentificat cu ${providerLabel}.`)
+      setError(null)
+    }
+  }, [oauthProvider, oauthStatus, oauthReason])
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
